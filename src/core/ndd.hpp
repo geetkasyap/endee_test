@@ -237,6 +237,8 @@ private:
     std::condition_variable persistence_cv_;
     std::unique_ptr<MetadataManager> metadata_manager_;
     // Autosave methods
+    std::mutex autosave_mutex_;
+    std::condition_variable autosave_cv_;
     std::thread autosave_thread_;
     std::atomic<bool> running_{true};
     BackupStore backup_store_;
@@ -333,8 +335,12 @@ private:
     void autosaveLoop() {
         LOG_INFO(2011, "Autosave thread started");
         while(running_) {
-            // Sleep for AUTOSAVE_SLEEP_MINUTES
-            std::this_thread::sleep_for(std::chrono::minutes(settings::AUTOSAVE_SLEEP_MINUTES));
+            {
+                std::unique_lock<std::mutex> lock(autosave_mutex_);
+                autosave_cv_.wait_for(lock,
+                                      std::chrono::minutes(settings::AUTOSAVE_SLEEP_MINUTES),
+                                      [this]() { return !running_; });
+            }
 
             // Check if we're still running
             if(!running_) {
@@ -610,22 +616,16 @@ public:
         // Signal all threads to stop (running_ is checked by autosave and backup threads)
         running_ = false;
 
+        // Wake up autosave thread immediately and join it cleanly without delay or detach
+        autosave_cv_.notify_all();
+        if(autosave_thread_.joinable()) {
+            autosave_thread_.join();
+        }
+
         // Join background backup and rebuild threads before destroying members
         // (prevents use-after-free when threads outlive IndexManager)
         backup_store_.joinAllThreads();
         rebuild_.joinAllThreads();
-
-        /**
-         * Don't wait for autosave thread to exit.
-         * Since the thread might be sleeping, waiting for join
-         * would be time consuming.
-         *
-         * TODO: This is a stop-gap solution.
-         * Fix it with conditional variables.
-         */
-        if(autosave_thread_.joinable()) {
-            autosave_thread_.detach();
-        }
 
         /**
          * Persist all the dirty indices to disk.
@@ -1324,33 +1324,42 @@ public:
     // meta, vector data Meta and vector data will be overwritten when the id is reused
     bool deleteVectorsByIds(CacheEntry& entry, const std::vector<ndd::idInt>& numeric_ids) {
         try {
+            std::vector<ndd::idInt> successfully_deleted_ids;
+            successfully_deleted_ids.reserve(numeric_ids.size());
+
             for(ndd::idInt numeric_id : numeric_ids) {
-                auto meta = entry.vector_storage->get_meta(numeric_id);
-                // Remove ID mapping by getting the string id from metadata
-                auto stored_ids = entry.id_mapper->deletePoints({meta.id});
-                if(stored_ids[0] != numeric_id) {
-                    LOG_DEBUG("Error: Mismatch in stored ID and numeric ID "
-                              << stored_ids[0] << " != " << numeric_id);
+                try {
+                    auto meta = entry.vector_storage->get_meta(numeric_id);
+                    // Remove ID mapping by getting the string id from metadata
+                    auto stored_ids = entry.id_mapper->deletePoints({meta.id});
+                    if(stored_ids.empty() || stored_ids[0] != numeric_id) {
+                        LOG_DEBUG("Error: Mismatch in stored ID and numeric ID for " << numeric_id);
+                        continue;
+                    }
+                    // Remove the filter
+                    entry.vector_storage->deleteFilter(numeric_id, meta.filter);
+                    // Mark as deleted in HNSW index
+                    entry.alg->markDelete(numeric_id);
+
+                    // Delete from sparse storage if hybrid index
+                    if(entry.sparse_storage) {
+                        entry.sparse_storage->delete_vector(numeric_id);
+                    }
+                    successfully_deleted_ids.push_back(numeric_id);
+                } catch(const std::exception& e) {
+                    LOG_WARN(2035, entry.index_id, "Skipping deletion for numeric ID " << numeric_id << ": " << e.what());
                     continue;
                 }
-                // Remove the filter
-                entry.vector_storage->deleteFilter(numeric_id, meta.filter);
-                // Mark as deleted in HNSW index
-
-                entry.alg->markDelete(numeric_id);
-
-                // Delete from sparse storage if hybrid index
-                if(entry.sparse_storage) {
-                    entry.sparse_storage->delete_vector(numeric_id);
-                }
             }
-            // Add the list to write ahead log using IndexManager's method
-            logDeletions(entry, numeric_ids);
+            if(!successfully_deleted_ids.empty()) {
+                // Add the list to write ahead log using IndexManager's method
+                logDeletions(entry, successfully_deleted_ids);
 
-            // Mark the index as dirty
-            entry.markDirty();
+                // Mark the index as dirty
+                entry.markDirty();
+            }
 
-            return true;
+            return !successfully_deleted_ids.empty();
         } catch(const std::exception& e) {
             LOG_ERROR(2035, entry.index_id, "Failed to delete vectors: " << e.what());
             return false;

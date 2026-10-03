@@ -38,7 +38,11 @@ std::string Rebuild::statusToString(RebuildStatus s) {
 std::string Rebuild::timeToISO8601(std::chrono::system_clock::time_point tp) {
     auto time_t_val = std::chrono::system_clock::to_time_t(tp);
     std::tm tm_val{};
+#if defined(_WIN32) || defined(_WIN64)
+    gmtime_s(&tm_val, &time_t_val);
+#else
     gmtime_r(&time_t_val, &tm_val);
+#endif
     std::ostringstream oss;
     oss << std::put_time(&tm_val, "%Y-%m-%dT%H:%M:%SZ");
     return oss.str();

@@ -410,7 +410,11 @@ public:
     std::vector<idInt> deletePoints(const std::vector<std::string>& external_ids) {
         std::vector<idInt> deleted_ids;
         MDBX_txn* txn;
-        mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+        int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+        if(rc != MDBX_SUCCESS) {
+            throw std::runtime_error("Failed to begin transaction: "
+                                     + std::string(mdbx_strerror(rc)));
+        }
 
         MDBX_val key, data;
         for(const auto& ext_id : external_ids) {
@@ -454,7 +458,11 @@ public:
             mdbx_put(txn, dbi_, &del_mdb_key, &del_mdb_val, MDBX_UPSERT);
         }
 
-        mdbx_txn_commit(txn);
+        rc = mdbx_txn_commit(txn);
+        if(rc != MDBX_SUCCESS) {
+            throw std::runtime_error("Failed to commit transaction: "
+                                     + std::string(mdbx_strerror(rc)));
+        }
         return deleted_ids;
     }
 
@@ -462,7 +470,11 @@ public:
     std::vector<idInt> getDeletedIds(size_t max_count) {
         std::vector<idInt> result;
         MDBX_txn* txn;
-        mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+        int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+        if(rc != MDBX_SUCCESS) {
+            throw std::runtime_error("Failed to begin transaction: "
+                                     + std::string(mdbx_strerror(rc)));
+        }
 
         std::string del_key = DELETED_IDS_KEY;
         MDBX_val key, val;
@@ -491,7 +503,11 @@ public:
             mdbx_del(txn, dbi_, &key, nullptr);
         }
 
-        mdbx_txn_commit(txn);
+        rc = mdbx_txn_commit(txn);
+        if(rc != MDBX_SUCCESS) {
+            throw std::runtime_error("Failed to commit transaction: "
+                                     + std::string(mdbx_strerror(rc)));
+        }
         return result;
     }
 
